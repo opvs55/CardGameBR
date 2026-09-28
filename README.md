@@ -11,6 +11,7 @@ npm test           # testes do motor (Vitest)
 npm run sim        # uma partida bot x bot narrada no terminal (npm run sim -- 42 para fixar a seed)
 npm run sim -- --n 1000   # estatística de 1000 partidas
 npm run build      # build de produção + PWA em dist/
+npm run db:seed    # regenera supabase/seed.sql a partir das cartas
 ```
 
 ## O que já existe (etapas 1–3 da ordem de construção)
@@ -56,6 +57,26 @@ npm run art -- --only mae --force # refaz uma carta
 
 O modelo padrão é `gemini-2.5-flash-image`; troque com `GEMINI_IMAGE_MODEL`. A chave fica só na sua máquina. Quando houver backend, a geração vai para a Edge Function `generate-art` e a chave fica no servidor. **Revise cada imagem** contra os limites do humor (seção 9) antes de commitar.
 
+## Backend (Supabase)
+
+Estrutura da seção 11 do design, pronta para ligar num projeto Supabase:
+
+- `supabase/migrations/20260928000000_init.sql`: tabelas (`families`, `cards`, `profiles`, `user_cards`, `decks`, `deck_cards`, `matches`, `match_moves`), RLS e a função `grant_pack`.
+- `supabase/seed.sql`: as 20 cartas e as 8 famílias, **gerado** a partir de `src/engine/cards` com `npm run db:seed` (o código continua sendo a fonte da verdade).
+- `supabase/functions/open-pack`: abre um pacotinho. Sorteia no servidor (70/22/7/1, pelo menos 1 Brilhante), desconta 100 moedas e grava em `user_cards` numa transação. Carimbadas ganham número de série.
+- `src/lib/supabase.ts`: cliente do app (`fetchProfile`, `fetchCollection`, `openPack`). Sem `VITE_SUPABASE_URL`/`VITE_SUPABASE_ANON_KEY` o app segue offline contra o bot.
+
+Regras de acesso: catálogo público; coleção, decks e jogadas só do dono; o jogador muda o próprio nome mas **não** as moedas; ninguém lê a jogada escondida do outro; só o servidor chama `grant_pack`. Novo cadastro ganha 500 moedas (a moeda da banca ainda está em aberto). Tudo isso é testado em `supabase/db.test.ts`, que roda a migração num Postgres em memória (PGlite).
+
+Para subir num projeto:
+
+```bash
+npx supabase login
+npx supabase link --project-ref <seu-projeto>
+npx supabase db push --include-seed
+npx supabase functions deploy open-pack
+```
+
 ## Decisões de regra tomadas na implementação
 
 O design deixava alguns pontos em aberto. Escolhi o seguinte, tudo fácil de mudar:
@@ -85,7 +106,7 @@ O design deixava alguns pontos em aberto. Escolhi o seguinte, tudo fácil de mud
 
 ## Próximos passos (ordem do design)
 
-4. Supabase: auth, tabelas, seed das cartas, `open-pack`, banca, abertura de pacote, álbum real.
+4. Supabase: ~~tabelas, seed, `open-pack`~~ (feito); falta login, tela de abertura de pacote e álbum com a coleção real.
 5. Deck builder com a coleção.
 6. Online: `submit-move` / `resolve-round` + Realtime (o motor já roda igual no servidor).
 7. Arte aprovada no Storage; `generate-art` como Edge Function.
