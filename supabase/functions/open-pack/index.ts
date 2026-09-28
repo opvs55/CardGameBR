@@ -19,7 +19,7 @@ Deno.serve(async (req) => {
   if (!user) return json({ error: 'Faça login para abrir pacotinhos.' }, 401);
 
   const admin = createClient(url, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!);
-  const { data: cards, error: cardsError } = await admin.from('cards').select('id');
+  const { data: cards, error: cardsError } = await admin.from('cards').select('id').eq('collectible', true);
   if (cardsError || !cards?.length) return json({ error: 'Catálogo de cartas indisponível.' }, 500);
 
   const pack = rollPack(

@@ -2,71 +2,90 @@
 // aqui eles viram mudanças no estado + entradas no log.
 //
 // Cada efeito é resolvido em duas fases: `plan` (checa condições, escolhe alvos,
-// consome o RNG) e `apply` (muda o estado). Assim dá para planejar dois efeitos
-// contra o mesmo estado e aplicar os dois "juntos" (empate de Pressa entre lados).
+// consome o RNG) e `apply` (muda o estado). Assim um efeito com várias ações
+// escolhe todos os alvos antes de qualquer dano acontecer.
 
 import { getCard } from './cards';
-import { allInPlay, cardName, defOf, hasTag, isNight, locate, other, ZERO } from './state';
-import type { Located } from './state';
 import type { Rng } from './rng';
 import { pick } from './rng';
+import { allMinions, findMinion, hasTag, isNight, newMinion, other, refName } from './state';
+import type { Located } from './state';
 import type {
-  Buffs,
   CardDef,
+  CardRef,
+  CharRef,
   Condition,
   Effect,
   GameState,
-  InPlay,
+  Keyword,
   LogEvent,
-  Scope,
+  Minion,
   Side,
   Target,
+  TargetSpec,
   Trigger,
 } from './types';
-import { ROW_SIZE } from './types';
-
-export interface RevealMeta {
-  played: [number, number];
-  tapped: [boolean, boolean];
-  spentAll: [boolean, boolean];
-}
+import { BOARD_SIZE, HAND_LIMIT } from './types';
 
 export interface Ctx {
   state: GameState;
   rng: Rng;
   log: LogEvent[];
-  meta: RevealMeta;
+}
+
+/** Quem disparou o efeito: uma carta na mesa, ou um feitiço/poder (uid null). */
+export interface Source {
+  side: Side;
+  uid: string | null;
+  name: string;
 }
 
 export type Thunk = () => void;
 
 // ───────────────────────────── Stats e auras ─────────────────────────────
 
-export interface Stats {
+interface Aura {
   power: number;
   toughness: number;
-  speed: number;
-  /** Resistência atual (toughness - dano). */
-  health: number;
+  keywords: Keyword[];
 }
 
-/** Soma de todas as auras `static` da mesa, por lado e carteira. */
-export function computeAuras(state: GameState): Buffs[][] {
-  const table: Buffs[][] = [0, 1].map(() => Array.from({ length: ROW_SIZE }, () => ({ ...ZERO })));
-  for (const src of allInPlay(state)) {
-    if (src.card.flipped) continue;
-    for (const effect of defOf(src.card).effects) {
+export interface MinionStats {
+  power: number;
+  toughness: number;
+  /** Resistência atual. */
+  health: number;
+  keywords: Keyword[];
+}
+
+export type Auras = Map<string, Aura>;
+
+export function computeAuras(state: GameState): Auras {
+  const table: Auras = new Map();
+  const get = (uid: string) => {
+    let a = table.get(uid);
+    if (!a) table.set(uid, (a = { power: 0, toughness: 0, keywords: [] }));
+    return a;
+  };
+  for (const l of allMinions(state)) {
+    if (l.minion.silenced) continue;
+    const src: Source = { side: l.side, uid: l.minion.uid, name: getCard(l.minion.defId).name };
+    for (const effect of getCard(l.minion.defId).effects) {
       if (effect.trigger !== 'static') continue;
       if (!checkConditions(state, src, effect.conditions)) continue;
-      const times = effect.repeatPer ? countTagAround(state, src, effect.repeatPer.tag, effect.repeatPer.scope) : 1;
+      const times = effect.repeatPer ? countAllies(state, src, effect.repeatPer.tag) : 1;
       if (times <= 0) continue;
       for (const action of effect.actions) {
-        if (action.kind !== 'buff') continue;
-        for (const t of resolveTargets(state, src, action.target)) {
-          const b = table[t.side][t.slot];
-          b.power += (action.power ?? 0) * times;
-          b.toughness += (action.toughness ?? 0) * times;
-          b.speed += (action.speed ?? 0) * times;
+        if (action.kind !== 'buff' && action.kind !== 'giveKeyword') continue;
+        for (const ref of resolveTargets(state, src, action.target)) {
+          if (ref.kind !== 'minion') continue;
+          const a = get(ref.uid);
+          if (action.kind === 'buff') {
+            a.power += (action.power ?? 0) * times;
+            a.toughness += (action.toughness ?? 0) * times;
+          } else if (!a.keywords.includes(action.keyword)) {
+            a.keywords.push(action.keyword);
+          }
         }
       }
     }
@@ -74,207 +93,264 @@ export function computeAuras(state: GameState): Buffs[][] {
   return table;
 }
 
-export function statsAt(state: GameState, side: Side, slot: number, auras = computeAuras(state)): Stats | null {
-  const card = state.players[side].row[slot];
-  if (!card) return null;
-  const def = defOf(card);
-  const aura = auras[side][slot];
-  if (card.flipped) {
-    // Levou Tapa: briga como 1/1 nesta rodada.
-    return { power: 1, toughness: 1, speed: def.speed, health: 1 - card.damage };
-  }
-  const power = Math.max(0, def.power + card.permBuffs.power + card.roundBuffs.power + aura.power);
-  const toughness = def.toughness + card.permBuffs.toughness + card.roundBuffs.toughness + aura.toughness;
-  const speed = def.speed + card.permBuffs.speed + card.roundBuffs.speed + aura.speed;
-  return { power, toughness, speed, health: toughness - card.damage };
+export function minionStats(m: Minion, auras: Auras): MinionStats {
+  const def = getCard(m.defId);
+  const aura = auras.get(m.uid) ?? { power: 0, toughness: 0, keywords: [] };
+  const power = Math.max(0, def.power + m.buffs.power + m.turnBuffs.power + aura.power);
+  const toughness = def.toughness + m.buffs.toughness + m.turnBuffs.toughness + aura.toughness;
+  const keywords = [
+    ...new Set([...(m.silenced ? [] : def.keywords), ...m.keywords, ...m.turnKeywords, ...aura.keywords]),
+  ];
+  return { power, toughness, health: toughness - m.damage, keywords };
+}
+
+export function statsOf(state: GameState, uid: string, auras = computeAuras(state)): MinionStats | null {
+  const l = findMinion(state, uid);
+  return l ? minionStats(l.minion, auras) : null;
 }
 
 // ───────────────────────────── Condições ─────────────────────────────
 
-function slotsInScope(slot: number, scope: Scope | undefined): number[] {
-  if (scope === 'neighbors') return [slot - 1, slot + 1].filter((s) => s >= 0 && s < ROW_SIZE);
-  return Array.from({ length: ROW_SIZE }, (_, i) => i);
-}
-
-function countTagAround(state: GameState, src: Located, tag: string, scope: Scope): number {
-  const row = state.players[src.side].row;
-  return slotsInScope(src.slot, scope).filter((s) => {
-    const c = row[s];
-    return c && s !== src.slot && hasTag(defOf(c), tag);
-  }).length;
+function countAllies(state: GameState, src: Source, tag: string): number {
+  return state.players[src.side].board.filter((m) => m.uid !== src.uid && hasTag(getCard(m.defId), tag)).length;
 }
 
 export function checkConditions(
   state: GameState,
-  src: Located,
+  src: Source,
   conditions: Condition[] | undefined,
-  extra: { meta?: RevealMeta; entering?: InPlay } = {},
+  extra: { entering?: CardRef } = {},
 ): boolean {
   if (!conditions) return true;
   const me = state.players[src.side];
-  const opp = other(src.side);
+  const opp = state.players[other(src.side)];
   return conditions.every((cond) => {
     switch (cond.kind) {
       case 'allyHasTag':
-        return countTagAround(state, src, cond.tag, cond.scope ?? 'row') > 0;
+        return countAllies(state, src, cond.tag) > 0;
       case 'enteringHasTag':
-        return !!extra.entering && hasTag(defOf(extra.entering), cond.tag);
+        return !!extra.entering && hasTag(getCard(extra.entering.defId), cond.tag);
       case 'isNight':
-        return isNight(state.round);
+        return isNight(state.turn);
       case 'isDay':
-        return !isNight(state.round);
-      case 'countFamily': {
-        const row = me.row;
-        const n = slotsInScope(src.slot, cond.scope).filter((s) => {
-          const c = row[s];
-          if (!c) return false;
-          const d = defOf(c);
-          return d.family === cond.family || !!d.wildcard;
-        }).length;
-        return n >= cond.min;
+        return !isNight(state.turn);
+      case 'countTag':
+        return (
+          allMinions(state).filter(
+            (l) =>
+              (cond.side === 'both' || (cond.side === 'ally') === (l.side === src.side)) &&
+              hasTag(getCard(l.minion.defId), cond.tag),
+          ).length >= cond.min
+        );
+      case 'turnsInPlay': {
+        const m = src.uid ? findMinion(state, src.uid)?.minion : null;
+        return !!m && Math.floor((state.turn - m.enteredTurn) / 2) + 1 === cond.eq;
       }
-      case 'countTag': {
-        const n = allInPlay(state).filter(
-          (l) =>
-            (cond.side === 'both' || (cond.side === 'ally') === (l.side === src.side)) &&
-            hasTag(defOf(l.card), cond.tag),
-        ).length;
-        return n >= cond.min;
-      }
-      case 'roundsInPlay':
-        return state.round - src.card.enteredRound + 1 === cond.eq;
-      case 'opponentPlayedAndTapped':
-        return !!extra.meta && extra.meta.played[opp] >= cond.plays && extra.meta.tapped[opp];
+      case 'opponentPlayedThisTurn':
+        return opp.playedThisTurn >= cond.min;
       case 'opponentSpentAllMerenda':
-        return !!extra.meta && extra.meta.spentAll[opp];
-      case 'hasEmptySlot':
-        return me.row.some((c) => c === null);
+        return opp.maxMerenda > 0 && opp.merenda === 0;
+      case 'hasBoardSpace':
+        return me.board.length < BOARD_SIZE;
     }
   });
 }
 
 // ───────────────────────────── Alvos ─────────────────────────────
 
-type TargetFilter = (l: Located) => boolean;
+const minionRef = (m: Minion): CharRef => ({ kind: 'minion', uid: m.uid });
+const heroRef = (side: Side): CharRef => ({ kind: 'hero', side });
 
-function at(state: GameState, side: Side, slots: number[]): Located[] {
-  const row = state.players[side].row;
-  return slots
-    .filter((s) => s >= 0 && s < ROW_SIZE && row[s])
-    .map((slot) => ({ side, slot, card: row[slot] as InPlay }));
+/** Alvos que o jogador pode escolher para uma carta/poder. */
+export function validTargets(state: GameState, side: Side, spec: TargetSpec): CharRef[] {
+  const opp = other(side);
+  const minions = (s: Side) =>
+    state.players[s].board.filter((m) => spec.maxCost === undefined || getCard(m.defId).cost <= spec.maxCost).map(minionRef);
+  switch (spec.kind) {
+    case 'anyCharacter':
+      return [...minions(side), ...minions(opp), heroRef(side), heroRef(opp)];
+    case 'anyMinion':
+      return [...minions(side), ...minions(opp)];
+    case 'enemyMinion':
+      return minions(opp);
+    case 'allyMinion':
+      return minions(side);
+    case 'enemyCharacter':
+      return [...minions(opp), heroRef(opp)];
+    case 'allyCharacter':
+      return [...minions(side), heroRef(side)];
+  }
 }
 
 export function resolveTargets(
   state: GameState,
-  src: Located,
+  src: Source,
   target: Target,
-  rng?: Rng,
-  filter: TargetFilter = () => true,
-): Located[] {
+  opts: { rng?: Rng; chosen?: CharRef; maxCost?: number } = {},
+): CharRef[] {
   const me = src.side;
   const opp = other(me);
-  const i = src.slot;
-  const all = (side: Side) => at(state, side, [0, 1, 2, 3, 4]);
-  let out: Located[];
+  const board = (s: Side) => state.players[s].board;
+  const costOk = (m: Minion) => opts.maxCost === undefined || getCard(m.defId).cost <= opts.maxCost;
+  const self = src.uid ? findMinion(state, src.uid) : null;
+  const randomOf = (refs: CharRef[]) => {
+    const chosen = opts.rng ? pick(opts.rng, refs) : undefined;
+    return chosen ? [chosen] : [];
+  };
   if (typeof target === 'string') {
     switch (target) {
       case 'self':
-        out = [src];
-        break;
+        return self ? [minionRef(self.minion)] : [];
       case 'neighbors':
-        out = at(state, me, [i - 1, i + 1]);
-        break;
-      case 'front':
-        out = at(state, opp, [i]);
-        break;
-      case 'allEnemies':
-        out = all(opp);
-        break;
-      case 'enemyNeighborsOfSelf':
-        out = at(state, opp, [i - 1, i, i + 1]);
-        break;
-      case 'blastZone':
-        out = [...at(state, me, [i - 1, i + 1]), ...at(state, opp, [i - 1, i, i + 1])];
-        break;
-      case 'randomEnemy': {
-        const chosen = rng ? pick(rng, all(opp).filter(filter)) : undefined;
-        return chosen ? [chosen] : [];
-      }
-    }
-  } else {
-    const sides: Side[] = target.side === 'both' ? [me, opp] : target.side === 'ally' ? [me] : [opp];
-    out = sides.flatMap((side) =>
-      side === me && target.scope === 'neighbors' ? at(state, side, [i - 1, i + 1]) : all(side),
-    );
-    out = out.filter((l) => {
-      const d = defOf(l.card);
-      return (
-        !(l.side === me && l.slot === i) &&
-        hasTag(d, target.tag) &&
-        (target.maxCost === undefined || d.cost <= target.maxCost)
-      );
-    });
-    if (target.random) {
-      const chosen = rng ? pick(rng, out.filter(filter)) : undefined;
-      return chosen ? [chosen] : [];
+        return self
+          ? [board(me)[self.index - 1], board(me)[self.index + 1]].filter((m): m is Minion => !!m).map(minionRef)
+          : [];
+      case 'chosen':
+        return opts.chosen ? [opts.chosen] : [];
+      case 'randomEnemy':
+        return randomOf([...board(opp).map(minionRef), heroRef(opp)]);
+      case 'randomEnemyMinion':
+        return randomOf(board(opp).filter(costOk).map(minionRef));
+      case 'allEnemyMinions':
+        return board(opp).map(minionRef);
+      case 'allOtherMinions':
+        return allMinions(state)
+          .filter((l) => l.minion.uid !== src.uid)
+          .map((l) => minionRef(l.minion));
+      case 'allyHero':
+        return [heroRef(me)];
+      case 'enemyHero':
+        return [heroRef(opp)];
     }
   }
-  return out.filter(filter);
+  const sides: Side[] = target.side === 'both' ? [me, opp] : target.side === 'ally' ? [me] : [opp];
+  return sides
+    .flatMap((s) => {
+      if (target.neighbors) {
+        if (!self || s !== me) return [];
+        return [board(me)[self.index - 1], board(me)[self.index + 1]].filter((m): m is Minion => !!m);
+      }
+      return board(s);
+    })
+    .filter((m) => m.uid !== src.uid && hasTag(getCard(m.defId), target.tag) && costOk(m))
+    .map(minionRef);
+}
+
+// ───────────────────────────── Operações básicas ─────────────────────────────
+
+export function dealDamage(ctx: Ctx, ref: CharRef, amount: number, label: string) {
+  if (amount <= 0) return;
+  const { state, log } = ctx;
+  if (ref.kind === 'hero') {
+    state.players[ref.side].hero.hp -= amount;
+    log.push({ type: 'damage', to: ref, amount, text: `${refName(state, ref)} toma ${amount} (${label}).` });
+    return;
+  }
+  const l = findMinion(state, ref.uid);
+  if (!l) return;
+  if (l.minion.shield) {
+    l.minion.shield = false;
+    log.push({ type: 'shield', to: ref, text: `O Capacete de ${refName(state, ref)} segurou o golpe!` });
+    return;
+  }
+  l.minion.damage += amount;
+  log.push({ type: 'damage', to: ref, amount, text: `${refName(state, ref)} toma ${amount} (${label}).` });
+}
+
+function heal(ctx: Ctx, ref: CharRef, amount: number, label: string) {
+  const { state, log } = ctx;
+  let healed = 0;
+  if (ref.kind === 'hero') {
+    const h = state.players[ref.side].hero;
+    healed = Math.min(amount, h.maxHp - h.hp);
+    h.hp += healed;
+  } else {
+    const l = findMinion(state, ref.uid);
+    if (!l) return;
+    healed = Math.min(amount, l.minion.damage);
+    l.minion.damage -= healed;
+  }
+  if (healed > 0) log.push({ type: 'heal', to: ref, amount: healed, text: `${refName(state, ref)} recupera ${healed} (${label}).` });
+}
+
+export function removeMinion(state: GameState, uid: string): Located | null {
+  const l = findMinion(state, uid);
+  if (l) state.players[l.side].board.splice(l.index, 1);
+  return l;
+}
+
+export function addToHand(ctx: Ctx, side: Side, ref: CardRef) {
+  const p = ctx.state.players[side];
+  if (p.hand.length >= HAND_LIMIT) {
+    p.discard.push(ref);
+    ctx.log.push({ type: 'move', side, text: `Mão cheia: ${getCard(ref.defId).name} foi pro lixo.` });
+  } else {
+    p.hand.push({ uid: ref.uid, defId: ref.defId });
+  }
+}
+
+export function drawCard(ctx: Ctx, side: Side) {
+  const p = ctx.state.players[side];
+  const card = p.deck.shift();
+  if (!card) {
+    p.fatigue += 1;
+    ctx.log.push({ type: 'fatigue', side, amount: p.fatigue, text: `Acabou o deck! Cansaço: ${p.fatigue} de dano.` });
+    dealDamage(ctx, { kind: 'hero', side }, p.fatigue, 'Cansaço');
+    return;
+  }
+  ctx.log.push({ type: 'draw', side, text: 'Comprou 1 carta.' });
+  addToHand(ctx, side, card);
+}
+
+/** Coloca uma carta na mesa (sem Chegada) e avisa as aliadas (onAllyEnter). */
+export function summon(ctx: Ctx, side: Side, ref: CardRef, position?: number): Minion | null {
+  const board = ctx.state.players[side].board;
+  if (board.length >= BOARD_SIZE) return null;
+  const m = newMinion(ref, ctx.state.turn);
+  const at = position === undefined ? board.length : Math.max(0, Math.min(position, board.length));
+  board.splice(at, 0, m);
+  ctx.log.push({ type: 'summon', side, uid: m.uid, defId: m.defId, text: `${getCard(m.defId).name} entra na mesa.` });
+  return m;
+}
+
+export function fireAllyEnter(ctx: Ctx, entering: Minion) {
+  const l = findMinion(ctx.state, entering.uid);
+  if (!l) return;
+  for (const ally of [...ctx.state.players[l.side].board]) {
+    if (ally.uid === entering.uid) continue;
+    const loc = findMinion(ctx.state, ally.uid);
+    if (loc) runTrigger(ctx, loc, 'onAllyEnter', { entering });
+  }
 }
 
 // ───────────────────────────── Execução ─────────────────────────────
 
-function removeFromRow(state: GameState, uid: string): Located | null {
-  const l = locate(state, uid);
-  if (l) state.players[l.side].row[l.slot] = null;
-  return l;
+export interface RunOpts {
+  chosen?: CharRef;
+  entering?: CardRef;
+  depth?: number;
 }
 
-/** Tira a carta da mesa e manda para a mão do dono, zerando dano e buffs. */
-export function returnToHand(state: GameState, uid: string): Located | null {
-  const l = removeFromRow(state, uid);
-  if (l) state.players[l.side].hand.push({ uid: l.card.uid, defId: l.card.defId });
-  return l;
-}
-
-export function sendToDiscard(state: GameState, uid: string): Located | null {
-  const l = removeFromRow(state, uid);
-  if (l) state.players[l.side].discard.push({ uid: l.card.uid, defId: l.card.defId });
-  return l;
-}
-
-/** Planeja um efeito da carta `src`. Retorna null se as condições não batem. */
-export function planEffect(ctx: Ctx, src: Located, effect: Effect, entering?: InPlay, depth = 0): Thunk[] | null {
+/** Planeja um efeito. Retorna null se as condições não batem. */
+export function planEffect(ctx: Ctx, src: Source, effect: Effect, opts: RunOpts = {}): Thunk[] | null {
   const { state, rng, log } = ctx;
-  if (!checkConditions(state, src, effect.conditions, { meta: ctx.meta, entering })) return null;
-  const def = defOf(src.card);
-  const label = effect.name ?? def.name;
-  const opp = other(src.side);
+  if (!checkConditions(state, src, effect.conditions, { entering: opts.entering })) return null;
+  const label = effect.name ?? src.name;
   const thunks: Thunk[] = [];
   // O nome do efeito só entra no log quando ele de fato faz alguma coisa.
   let announced = false;
   const announce = () => {
     if (announced) return;
     announced = true;
-    log.push({
-      type: 'effect',
-      side: src.side,
-      slot: src.slot,
-      name: label,
-      text: /[!?.]$/.test(label) ? `${def.name}: ${label}` : `${def.name}: ${label}!`,
-    });
+    if (label === src.name) return; // "Chinelada: Chinelada!" não diz nada
+    log.push({ type: 'effect', side: src.side, name: label, text: /[!?.]$/.test(label) ? `${src.name}: ${label}` : `${src.name}: ${label}!` });
   };
-  const say = (e: LogEvent) => {
-    announce();
-    log.push(e);
-  };
-
-  // Cada alvo é guardado pelo uid e reencontrado na hora de aplicar.
-  const each = (targets: Located[], fn: (l: Located) => void) => {
-    const uids = targets.map((t) => t.card.uid);
+  const targets = (target: Target, maxCost?: number) => resolveTargets(state, src, target, { rng, chosen: opts.chosen, maxCost });
+  const onMinions = (refs: CharRef[], fn: (l: Located) => void) => {
     thunks.push(() => {
-      for (const uid of uids) {
-        const l = locate(state, uid);
+      for (const ref of refs) {
+        if (ref.kind !== 'minion') continue;
+        const l = findMinion(state, ref.uid);
         if (l) fn(l);
       }
     });
@@ -282,179 +358,196 @@ export function planEffect(ctx: Ctx, src: Located, effect: Effect, entering?: In
 
   for (const action of effect.actions) {
     switch (action.kind) {
-      case 'damage':
-        each(resolveTargets(state, src, action.target, rng), (l) => {
-          l.card.damage += action.amount;
-          say({
-            type: 'damage',
-            side: l.side,
-            slot: l.slot,
-            amount: action.amount,
-            text: `${cardName(l.card)} toma -${action.amount} (${label}).`,
-          });
+      case 'damage': {
+        const refs = targets(action.target);
+        thunks.push(() => {
+          for (const ref of refs) {
+            announce();
+            dealDamage(ctx, ref, action.amount, label);
+          }
         });
         break;
-      case 'heal':
-        each(resolveTargets(state, src, action.target, rng), (l) => {
-          const healed = Math.min(action.amount, l.card.damage);
-          if (healed <= 0) return;
-          l.card.damage -= healed;
-          say({
-            type: 'heal',
-            side: l.side,
-            slot: l.slot,
-            amount: healed,
-            text: `${cardName(l.card)} recupera ${healed} (${label}).`,
-          });
-        });
+      }
+      case 'heal': {
+        const refs = targets(action.target);
+        thunks.push(() => refs.forEach((ref) => heal(ctx, ref, action.amount, label)));
+        // Anuncia só se curou alguém: heal() já registra a cura.
         break;
+      }
       case 'buff':
-        each(resolveTargets(state, src, action.target, rng), (l) => {
-          const b = action.duration === 'permanent' ? l.card.permBuffs : l.card.roundBuffs;
+        onMinions(targets(action.target), (l) => {
+          const b = action.duration === 'permanent' ? l.minion.buffs : l.minion.turnBuffs;
           b.power += action.power ?? 0;
           b.toughness += action.toughness ?? 0;
-          b.speed += action.speed ?? 0;
           const parts = [
             action.power ? `${action.power > 0 ? '+' : ''}${action.power} Força` : '',
             action.toughness ? `${action.toughness > 0 ? '+' : ''}${action.toughness} Resistência` : '',
-            action.speed ? `${action.speed > 0 ? '+' : ''}${action.speed} Pressa` : '',
           ].filter(Boolean);
-          say({ type: 'buff', side: l.side, slot: l.slot, text: `${cardName(l.card)} ganha ${parts.join(', ')}.` });
-        });
-        break;
-      case 'directAttack':
-        each(resolveTargets(state, src, action.target, rng), (l) => {
-          l.card.directAttack = true;
-          say({ type: 'buff', side: l.side, slot: l.slot, text: `${cardName(l.card)} vai direto na Moral!` });
-        });
-        break;
-      case 'noFight':
-        each(resolveTargets(state, src, action.target, rng), (l) => {
-          l.card.noFight = true;
           announce();
+          log.push({ type: 'buff', to: minionRef(l.minion), text: `${getCard(l.minion.defId).name} fica com ${parts.join(' e ')}.` });
         });
         break;
-      case 'suspend': {
-        const eligible: TargetFilter = (l) => {
-          const d = defOf(l.card);
-          return !d.immuneToSuspend && (action.maxCost === undefined || d.cost <= action.maxCost);
-        };
-        each(resolveTargets(state, src, action.target, rng, eligible), (l) => {
-          removeFromRow(state, l.card.uid);
-          l.card.roundBuffs = { ...ZERO };
-          l.card.directAttack = false;
-          l.card.noFight = false;
-          state.players[l.side].diretoria.push({ card: l.card, slot: l.slot, returnRound: state.round + 2 });
-          say({ type: 'suspend', side: l.side, slot: l.slot, text: `${cardName(l.card)} foi para a Diretoria.` });
+      case 'giveKeyword':
+        onMinions(targets(action.target), (l) => {
+          const list = action.duration === 'permanent' ? l.minion.keywords : l.minion.turnKeywords;
+          if (!list.includes(action.keyword)) list.push(action.keyword);
+          if (action.keyword === 'capacete') l.minion.shield = true;
         });
         break;
-      }
+      case 'suspend':
+        onMinions(targets(action.target, action.maxCost), (l) => {
+          const def = getCard(l.minion.defId);
+          if (def.immuneToSuspend || (action.maxCost !== undefined && def.cost > action.maxCost)) return;
+          removeMinion(state, l.minion.uid);
+          l.minion.turnBuffs = { power: 0, toughness: 0 };
+          l.minion.turnKeywords = [];
+          // Perde o próximo turno do dono e volta no fim dele.
+          const ownerNext = state.active === l.side ? state.turn + 2 : state.turn + 1;
+          state.players[l.side].diretoria.push({ minion: l.minion, returnTurn: ownerNext });
+          announce();
+          log.push({ type: 'move', side: l.side, text: `${def.name} foi para a Diretoria.` });
+        });
+        break;
       case 'returnToHand':
-        each(resolveTargets(state, src, action.target, rng), (l) => {
-          returnToHand(state, l.card.uid);
-          say({ type: 'return', side: l.side, slot: l.slot, text: `${cardName(l.card)} volta para a mão.` });
+        onMinions(targets(action.target, action.maxCost), (l) => {
+          removeMinion(state, l.minion.uid);
+          announce();
+          log.push({ type: 'move', side: l.side, text: `${getCard(l.minion.defId).name} volta para a mão.` });
+          addToHand(ctx, l.side, { uid: l.minion.uid, defId: l.minion.defId });
+        });
+        break;
+      case 'silence':
+        onMinions(targets(action.target), (l) => {
+          const m = l.minion;
+          m.silenced = true;
+          m.buffs = { power: 0, toughness: 0 };
+          m.turnBuffs = { power: 0, toughness: 0 };
+          m.keywords = [];
+          m.turnKeywords = [];
+          m.shield = false;
+          announce();
+          log.push({ type: 'buff', to: minionRef(m), text: `${getCard(m.defId).name} ficou virada: sem efeitos.` });
         });
         break;
       case 'destroy':
-        each(resolveTargets(state, src, action.target, rng), (l) => {
-          sendToDiscard(state, l.card.uid);
-          say({ type: 'death', side: l.side, slot: l.slot, defId: l.card.defId, text: `${cardName(l.card)} sai do jogo.` });
-        });
-        break;
-      case 'swapEnemies': {
-        const row = state.players[opp].row;
-        const occupied = row.flatMap((c, s) => (c ? [s] : []));
-        const empty = row.flatMap((c, s) => (c ? [] : [s]));
-        const first = pick(rng, occupied);
-        if (first === undefined) break;
-        const rest = occupied.filter((s) => s !== first);
-        const second = rest.length > 0 ? pick(rng, rest) : pick(rng, empty);
-        if (second === undefined) break;
-        thunks.push(() => {
-          const r = state.players[opp].row;
-          [r[first], r[second]] = [r[second], r[first]];
-          say({
-            type: 'swap',
-            side: opp,
-            a: first,
-            b: second,
-            text: `Redemoinho! As carteiras ${first + 1} e ${second + 1} trocaram de lugar.`,
-          });
-        });
-        break;
-      }
-      case 'diagonalFight':
-        thunks.push(() => {
-          state.diagonal[src.side] = true;
+        onMinions(targets(action.target), (l) => {
+          removeMinion(state, l.minion.uid);
+          state.players[l.side].discard.push({ uid: l.minion.uid, defId: l.minion.defId });
           announce();
+          log.push({ type: 'death', side: l.side, uid: l.minion.uid, defId: l.minion.defId, text: `${getCard(l.minion.defId).name} sai do jogo.` });
+        });
+        break;
+      case 'summon':
+        thunks.push(() => {
+          announce();
+          for (let i = 0; i < action.count; i++) {
+            const m = summon(ctx, src.side, { uid: `t${state.nextUid++}`, defId: action.cardId });
+            if (m) fireAllyEnter(ctx, m);
+          }
+        });
+        break;
+      case 'draw':
+        thunks.push(() => {
+          announce();
+          for (let i = 0; i < action.count; i++) drawCard(ctx, src.side);
+        });
+        break;
+      case 'gainMerenda':
+        thunks.push(() => {
+          const p = state.players[src.side];
+          announce();
+          if (action.when === 'now') {
+            p.merenda += action.amount;
+            log.push({ type: 'merenda', side: src.side, text: `+${action.amount} de Merenda neste turno.` });
+          } else {
+            p.bonusMerenda += action.amount;
+            log.push({ type: 'merenda', side: src.side, text: `+${action.amount} de Merenda no próximo turno.` });
+          }
         });
         break;
       case 'peekHand': {
-        const seen = pick(rng, state.players[opp].hand);
+        const seen = pick(rng, state.players[other(src.side)].hand);
         if (!seen) break;
         thunks.push(() => {
           state.players[src.side].peek = seen.defId;
-          say({ type: 'peek', side: src.side, text: `${def.name} espiou uma carta da mão do outro lado.` });
+          announce();
+          log.push({ type: 'peek', side: src.side, text: `${src.name} espiou uma carta da mão do outro lado.` });
         });
         break;
       }
-      case 'stealMerenda':
-        thunks.push(() => {
-          state.players[opp].stolenMerenda += action.amount;
-          say({ type: 'merenda', side: src.side, amount: action.amount, text: `${def.name} vai roubar ${action.amount} de Merenda na próxima rodada.` });
+      case 'repeatChegada': {
+        if ((opts.depth ?? 0) > 0) break;
+        const candidates = state.players[src.side].board.filter((m) => {
+          const def = getCard(m.defId);
+          return (
+            m.uid !== src.uid &&
+            !m.silenced &&
+            def.effects.some((e) => e.trigger === 'chegada') &&
+            !def.effects.some((e) => e.actions.some((a) => a.kind === 'repeatChegada'))
+          );
         });
-        break;
-      case 'repeatEnterEffect': {
-        if (depth > 0) break;
-        const candidates = state.players[src.side].row
-          .flatMap((c, slot) => (c ? [{ side: src.side, slot, card: c }] : []))
-          .filter(
-            (l) =>
-              l.card.uid !== src.card.uid &&
-              !l.card.flipped &&
-              !defOf(l.card).effects.some((e) => e.actions.some((a) => a.kind === 'repeatEnterEffect')) &&
-              defOf(l.card).effects.some((e) => e.trigger === 'onEnter'),
-          )
-          .sort((a, b) => b.card.enteredRound - a.card.enteredRound || a.slot - b.slot);
-        const chosen = candidates[0];
-        if (!chosen) break;
+        const chosenAlly = pick(rng, candidates);
+        if (!chosenAlly) break;
+        const loc = findMinion(state, chosenAlly.uid)!;
+        const def = getCard(chosenAlly.defId);
+        const target = def.target ? pick(rng, validTargets(state, loc.side, def.target)) : undefined;
         thunks.push(() => {
-          say({ type: 'buff', side: src.side, slot: src.slot, text: `Repete o efeito de entrada de ${cardName(chosen.card)}.` });
+          announce();
+          log.push({ type: 'effect', side: src.side, name: label, text: `Repete a Chegada de ${def.name}.` });
         });
-        for (const e of defOf(chosen.card).effects) {
-          if (e.trigger !== 'onEnter') continue;
-          const planned = planEffect(ctx, chosen, e, undefined, depth + 1);
+        for (const e of def.effects) {
+          if (e.trigger !== 'chegada') continue;
+          const planned = planEffect(ctx, { side: loc.side, uid: chosenAlly.uid, name: def.name }, e, {
+            chosen: target,
+            depth: (opts.depth ?? 0) + 1,
+          });
           if (planned) thunks.push(...planned);
         }
         break;
       }
       case 'enterFree':
-        // Só faz sentido na mão; tratado em round.ts.
-        break;
+        break; // tratado em game.ts (a carta está na mão)
     }
   }
   return thunks;
 }
 
-export function planTrigger(ctx: Ctx, src: Located, trigger: Trigger, entering?: InPlay): Thunk[] {
-  if (src.card.flipped) return [];
-  const out: Thunk[] = [];
-  for (const effect of defOf(src.card).effects) {
+export function runEffect(ctx: Ctx, src: Source, effect: Effect, opts: RunOpts = {}) {
+  planEffect(ctx, src, effect, opts)?.forEach((t) => t());
+}
+
+/** Dispara um gatilho de uma carta na mesa. */
+export function runTrigger(ctx: Ctx, l: Located, trigger: Trigger, opts: RunOpts = {}) {
+  if (l.minion.silenced) return;
+  const def = getCard(l.minion.defId);
+  for (const effect of def.effects) {
     if (effect.trigger !== trigger) continue;
-    const planned = planEffect(ctx, src, effect, entering);
-    if (planned) out.push(...planned);
+    // A carta pode ter saído da mesa por um efeito anterior.
+    if (!findMinion(ctx.state, l.minion.uid)) return;
+    runEffect(ctx, { side: l.side, uid: l.minion.uid, name: def.name }, effect, opts);
   }
-  return out;
 }
 
-/** Dispara um gatilho em todas as cartas da mesa ao mesmo tempo. */
-export function fireAll(ctx: Ctx, trigger: Trigger) {
-  const thunks = allInPlay(ctx.state).flatMap((src) => planTrigger(ctx, src, trigger));
-  thunks.forEach((t) => t());
+/** Dispara um gatilho em todas as cartas de um lado, da esquerda para a direita. */
+export function fireSide(ctx: Ctx, side: Side, trigger: Trigger) {
+  for (const m of [...ctx.state.players[side].board]) {
+    const l = findMinion(ctx.state, m.uid);
+    if (l) runTrigger(ctx, l, trigger);
+  }
 }
 
-export function hasTrigger(def: CardDef, trigger: Trigger) {
-  return def.effects.some((e) => e.trigger === trigger);
+/** A Chegada desta carta precisa de alvo agora? (tem alvo, condição bate e há alvos válidos) */
+export function needsTarget(state: GameState, side: Side, def: CardDef): boolean {
+  if (!def.target) return false;
+  if (validTargets(state, side, def.target).length === 0) return false;
+  if (def.kind === 'spell') return true;
+  const src: Source = { side, uid: null, name: def.name };
+  return def.effects.some(
+    (e) =>
+      e.trigger === 'chegada' &&
+      e.actions.some((a) => 'target' in a && a.target === 'chosen') &&
+      checkConditions(state, src, e.conditions),
+  );
 }
 
 export { getCard };

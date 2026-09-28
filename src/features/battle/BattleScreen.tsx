@@ -1,49 +1,77 @@
 import { AnimatePresence, motion } from 'framer-motion';
-import { ArrowLeft, Eye, Hand, Heart, Layers, Moon, Sandwich, Sun, Timer } from 'lucide-react';
+import { ArrowLeft, Eye, Heart, Layers, Moon, Plus, Sandwich, Sun, Timer } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
-import { cardName, computeAuras, getCard, isNight, statsAt } from '../../engine';
-import type { GameState, InPlay, LogEvent, Side, Stats } from '../../engine';
+import {
+  canAttack,
+  canPlay,
+  canUsePower,
+  cardName,
+  computeAuras,
+  getCard,
+  getHero,
+  isNight,
+  KEYWORD_INFO,
+  minionStats,
+  roundOf,
+} from '../../engine';
+import type { CharRef, GameState, LogEvent, Minion, Side } from '../../engine';
 import { Card } from '../../ui/Card';
-import { merendaLeft, TURN_SECONDS, useBattle } from './store';
+import { TURN_SECONDS, useBattle } from './store';
 
 const ICON = { strokeWidth: 2.75, size: 16 } as const;
 
+const refKey = (r: CharRef) => (r.kind === 'hero' ? `hero-${r.side}` : r.uid);
+
 export function BattleScreen({ onExit }: { onExit: () => void }) {
   const b = useBattle();
-  const [detail, setDetail] = useState<{ card: InPlay; stats: Stats | null } | null>(null);
+  const [detail, setDetail] = useState<Minion | null>(null);
   const [showLog, setShowLog] = useState(false);
-  const shown = b.revealState ?? b.state;
-  const auras = useMemo(() => (shown ? computeAuras(shown) : null), [shown]);
-
-  if (!shown || !b.state || !auras) return null;
   const state = b.state;
-  const me = shown.players[0];
-  const bot = shown.players[1];
-  const night = isNight(shown.round);
-  const choosing = b.phase === 'choosing' && state.winner === null;
-  const left = merendaLeft(state, b.pending);
-  const pendingBySlot = new Map(b.pending.map((p) => [p.slot, p.uid]));
-  const selectedDef = b.selected ? getCard(state.players[0].hand.find((c) => c.uid === b.selected)!.defId) : null;
-  const visibleHistory = b.history.slice(0, b.history.length - (b.lastLog.length - b.played));
-  // Números flutuantes só durante a resolução, para as últimas entradas que tocaram.
-  const recent =
-    b.phase === 'resolving' ? b.lastLog.map((e, i) => ({ e, i })).slice(Math.max(0, b.played - 3), b.played) : [];
+  const auras = useMemo(() => (state ? computeAuras(state) : null), [state]);
 
-  const openDetail = (side: Side, slot: number) => {
-    const card = shown.players[side].row[slot];
-    if (card) setDetail({ card, stats: statsAt(shown, side, slot, auras) });
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && b.cancel();
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [b]);
+
+  if (!state || !auras) return null;
+  const me = state.players[0];
+  const myTurn = state.active === 0 && state.winner === null;
+  const night = isNight(state.turn);
+  const targets = new Set(b.mode.kind === 'target' ? b.mode.targets.map(refKey) : []);
+  const selectedUid = b.mode.kind === 'place' || (b.mode.kind === 'target' && b.mode.action === 'play') ? b.mode.uid : null;
+  const attackerUid = b.mode.kind === 'target' && b.mode.action === 'attack' ? b.mode.uid : null;
+  const selectedDef = selectedUid ? getCard(me.hand.find((c) => c.uid === selectedUid)!.defId) : null;
+
+  // Números flutuantes da última ação.
+  const floaters = new Map<string, { label: string; kind: string; i: number }[]>();
+  b.lastEvents.forEach((e, i) => {
+    if (e.type !== 'damage' && e.type !== 'heal' && e.type !== 'shield') return;
+    const k = refKey(e.to);
+    const label = e.type === 'damage' ? `-${e.amount}` : e.type === 'heal' ? `+${e.amount}` : 'Capacete!';
+    floaters.set(k, [...(floaters.get(k) ?? []), { label, kind: e.type, i }]);
+  });
+
+  const onMinion = (m: Minion, side: Side) => {
+    if (b.mode.kind === 'target') return b.clickMinion(m.uid);
+    if (side === 0 && myTurn && canAttack(state, m.uid)) return b.clickMinion(m.uid);
+    setDetail(m);
   };
 
-  const onMySlot = (slot: number) => {
-    if (!choosing) return openDetail(0, slot);
-    if (pendingBySlot.has(slot)) return b.unplace(slot);
-    if (b.selected && !me.row[slot]) return b.placeAt(slot);
-    openDetail(0, slot);
-  };
-  const onBotSlot = (slot: number) => {
-    if (choosing && b.tapMode) return b.tapAt(slot);
-    openDetail(1, slot);
-  };
+  const hint =
+    b.error ??
+    (state.winner !== null
+      ? 'Fim de jogo.'
+      : !myTurn
+        ? 'Vez do bot...'
+        : b.mode.kind === 'place'
+          ? 'Toque num dos espaços da sua mesa para colocar a carta.'
+          : b.mode.kind === 'target'
+            ? b.mode.action === 'attack'
+              ? 'Escolha quem atacar (destacados). Esc cancela.'
+              : 'Escolha o alvo (destacados). Esc cancela.'
+            : 'Jogue cartas, ataque com as que brilham ou passe a vez.');
 
   return (
     <div className={`battle ${night ? 'is-night' : 'is-day'}`}>
@@ -52,37 +80,59 @@ export function BattleScreen({ onExit }: { onExit: () => void }) {
           <button className="btn btn-ghost" onClick={onExit} aria-label="Sair da partida">
             <ArrowLeft {...ICON} /> Banca
           </button>
-          <Clock round={shown.round} night={night} />
-          <TurnTimer key={`${state.round}-${b.phase}`} active={choosing} onTimeout={b.confirm} />
+          <span className="clock">
+            {night ? <Moon {...ICON} /> : <Sun {...ICON} />} Rodada {roundOf(state.turn)} · {night ? 'Noite' : 'Dia'}
+          </span>
+          <TurnTimer key={state.turn} active={myTurn} onTimeout={b.endTurn} />
         </div>
 
-        <Hud label="Bot" player={bot} handCount={bot.hand.length} />
-        <Row
+        <HeroBar
           side={1}
-          state={shown}
+          state={state}
+          targeted={targets.has('hero-1')}
+          floaters={floaters.get('hero-1')}
+          eventKey={b.eventKey}
+          onClick={() => b.clickHero(1)}
+          thinking={b.botThinking}
+        />
+        <Board
+          side={1}
+          state={state}
           auras={auras}
-          recent={recent}
-          revealing={b.phase === 'revealing'}
-          tapSlot={b.tapSlot}
-          targetable={choosing && b.tapMode}
-          onSlot={onBotSlot}
+          targets={targets}
+          floaters={floaters}
+          eventKey={b.eventKey}
+          onMinion={onMinion}
         />
 
         <div className="battle-divider">
-          <span>{night ? 'Noite no recreio' : 'Dia no recreio'}</span>
+          <span>{myTurn ? 'Sua vez' : 'Vez do bot'}</span>
         </div>
 
-        <Row
+        <Board
           side={0}
-          state={shown}
+          state={state}
           auras={auras}
-          recent={recent}
-          revealing={b.phase === 'revealing'}
-          pending={b.pending.map((p) => ({ slot: p.slot, defId: state.players[0].hand.find((c) => c.uid === p.uid)!.defId }))}
-          targetable={choosing && !!b.selected}
-          onSlot={onMySlot}
+          targets={targets}
+          floaters={floaters}
+          eventKey={b.eventKey}
+          onMinion={onMinion}
+          placing={b.mode.kind === 'place'}
+          onPlace={b.placeAt}
+          attackerUid={attackerUid}
+          myTurn={myTurn}
         />
-        <Hud label="Você" player={me} handCount={me.hand.length} merendaLeft={choosing ? left : undefined} />
+        <HeroBar
+          side={0}
+          state={state}
+          targeted={targets.has('hero-0')}
+          floaters={floaters.get('hero-0')}
+          eventKey={b.eventKey}
+          onClick={() => b.clickHero(0)}
+          onPower={b.clickPower}
+          powerReady={myTurn && !canUsePower(state)}
+          powerActive={b.mode.kind === 'target' && b.mode.action === 'power'}
+        />
 
         {me.peek && (
           <p className="peek">
@@ -91,37 +141,42 @@ export function BattleScreen({ onExit }: { onExit: () => void }) {
         )}
 
         <div className="actions">
-          <button
-            className={`btn btn-secondary ${b.tapMode ? 'is-active' : ''}`}
-            disabled={!choosing || me.tapas <= 0}
-            onClick={() => b.setTapMode(!b.tapMode)}
-            aria-pressed={b.tapMode}
-          >
-            <Hand {...ICON} /> {b.tapSlot !== undefined ? `Tapa na ${b.tapSlot + 1}` : 'Tapa'}
-          </button>
-          <button className="btn btn-primary btn-bafo" disabled={!choosing} onClick={b.confirm}>
-            Bafo!
+          <p className="hint" aria-live="polite">
+            {hint}
+          </p>
+          {b.mode.kind !== 'idle' && (
+            <button className="btn btn-secondary" onClick={b.cancel}>
+              Cancelar
+            </button>
+          )}
+          <button className="btn btn-primary btn-end" disabled={!myTurn} onClick={b.endTurn}>
+            Passar a vez
           </button>
           <button className="btn btn-secondary log-toggle" onClick={() => setShowLog((v) => !v)}>
             Log
           </button>
         </div>
-        <p className="hint" aria-live="polite">
-          {b.error ??
-            (state.winner !== null
-              ? 'Fim de jogo.'
-              : b.phase === 'revealing'
-              ? 'Bafo! Revelando...'
-              : !choosing
-                ? 'Resolvendo a rodada...'
-                : b.tapMode
-                  ? 'Escolha uma carteira do bot. Acerta se ele jogar carta nova ali.'
-                  : b.selected
-                    ? 'Toque numa carteira vazia sua.'
-                    : `Escolha até 2 cartas (${left} de Merenda livre) e aperte Bafo!`)}
-        </p>
 
-        <HandView hand={state.players[0].hand} pending={b.pending.map((p) => p.uid)} selected={b.selected} merenda={left} onSelect={b.select} disabled={!choosing} />
+        <div className="hand" role="list" aria-label="Sua mão">
+          {me.hand.map((c) => {
+            const def = getCard(c.defId);
+            const playable = myTurn && !canPlay(state, c.uid);
+            return (
+              <motion.button
+                layout
+                key={c.uid}
+                role="listitem"
+                className={`hand-card ${selectedUid === c.uid ? 'is-selected' : ''} ${playable ? 'is-playable' : 'is-expensive'}`}
+                onClick={() => b.clickHand(c.uid)}
+                aria-pressed={selectedUid === c.uid}
+                initial={{ y: 30, opacity: 0 }}
+                animate={{ y: 0, opacity: 1 }}
+              >
+                <Card card={def} size="mini" />
+              </motion.button>
+            );
+          })}
+        </div>
         {selectedDef && (
           <div className="selected-detail">
             <Card card={selectedDef} size="full" />
@@ -131,49 +186,17 @@ export function BattleScreen({ onExit }: { onExit: () => void }) {
 
       <aside className={`battle-log ${showLog ? 'is-open' : ''}`}>
         <h4>O que rolou</h4>
-        <LogList events={visibleHistory} />
+        <LogList events={b.history} />
       </aside>
 
-      <AnimatePresence>
-        {b.phase === 'revealing' && (
-          <motion.div
-            className="bafo-flash"
-            initial={{ scale: 0.4, opacity: 0, rotate: -12 }}
-            animate={{ scale: 1, opacity: 1, rotate: -4 }}
-            exit={{ scale: 1.6, opacity: 0 }}
-            transition={{ type: 'spring', stiffness: 300, damping: 14 }}
-          >
-            Bafo!
-          </motion.div>
-        )}
-      </AnimatePresence>
-
       {detail && (
-        <div className="dialog-backdrop" onClick={() => setDetail(null)}>
-          <div className="dialog card-dialog" onClick={(e) => e.stopPropagation()}>
-            <Card card={getCard(detail.card.defId)} stats={detail.stats} size="full" />
-            {detail.card.damage > 0 && <p className="text-muted">Dano acumulado: {detail.card.damage}</p>}
-            <div className="dialog-actions">
-              <button className="btn btn-primary" onClick={() => setDetail(null)}>
-                Fechar
-              </button>
-            </div>
-          </div>
-        </div>
+        <MinionDialog minion={detail} state={state} auras={auras} onClose={() => setDetail(null)} />
       )}
 
-      {state.winner !== null && b.phase === 'choosing' && (
-        <ResultDialog winner={state.winner} onAgain={() => b.start(b.playerDeck)} onExit={onExit} />
+      {state.winner !== null && (
+        <ResultDialog winner={state.winner} onAgain={() => b.start(b.deckIndex)} onExit={onExit} />
       )}
     </div>
-  );
-}
-
-function Clock({ round, night }: { round: number; night: boolean }) {
-  return (
-    <span className="clock" title={night ? 'Noite' : 'Dia'}>
-      {night ? <Moon {...ICON} /> : <Sun {...ICON} />} Rodada {round}
-    </span>
   );
 }
 
@@ -188,163 +211,185 @@ function TurnTimer({ active, onTimeout }: { active: boolean; onTimeout: () => vo
     if (active && left <= 0) onTimeout();
   }, [active, left, onTimeout]);
   return (
-    <span className={`timer ${left <= 5 && active ? 'is-low' : ''}`} aria-label="Tempo para jogar">
+    <span className={`timer ${left <= 10 && active ? 'is-low' : ''}`} aria-label="Tempo do turno">
       <Timer {...ICON} /> {active ? `${Math.max(0, left)}s` : '…'}
     </span>
   );
 }
 
-function Hud({
-  label,
-  player,
-  handCount,
-  merendaLeft,
-}: {
-  label: string;
-  player: GameState['players'][number];
-  handCount: number;
-  merendaLeft?: number;
-}) {
+function Floaters({ items, eventKey }: { items?: { label: string; kind: string; i: number }[]; eventKey: number }) {
   return (
-    <div className="hud">
-      <strong className="hud-name">{label}</strong>
-      <span className="hud-item moral" title="Moral">
-        <Heart {...ICON} /> {player.moral}
-      </span>
-      <span className="hud-item" title="Merenda">
-        <Sandwich {...ICON} /> {merendaLeft ?? player.merenda}
-      </span>
-      <span className="hud-item" title="Tapas">
-        <Hand {...ICON} /> {player.tapas}
-      </span>
-      <span className="hud-item" title="Mão / deck">
-        <Layers {...ICON} /> {handCount}/{player.deck.length}
-      </span>
+    <AnimatePresence>
+      {items?.map(({ label, kind, i }) => (
+        <motion.span
+          key={`${eventKey}-${i}`}
+          className={`floater ${kind}`}
+          initial={{ y: 10, opacity: 0, scale: 0.6 }}
+          animate={{ y: -18, opacity: [0, 1, 1, 0], scale: 1.2 }}
+          transition={{ duration: 1.4, times: [0, 0.15, 0.75, 1] }}
+        >
+          {label}
+        </motion.span>
+      ))}
+    </AnimatePresence>
+  );
+}
+
+function HeroBar(props: {
+  side: Side;
+  state: GameState;
+  targeted: boolean;
+  floaters?: { label: string; kind: string; i: number }[];
+  eventKey: number;
+  onClick: () => void;
+  onPower?: () => void;
+  powerReady?: boolean;
+  powerActive?: boolean;
+  thinking?: boolean;
+}) {
+  const { side, state } = props;
+  const p = state.players[side];
+  const hero = getHero(p.hero.heroId);
+  const active = state.active === side && state.winner === null;
+  const initials = hero.name
+    .split(/\s+/)
+    .filter((w) => w.length >= 2)
+    .map((w) => w[0])
+    .join('');
+  return (
+    <div className={`herobar herobar-${side === 0 ? 'me' : 'bot'} ${active ? 'is-active' : ''}`}>
+      <button
+        className={`hero-portrait ${props.targeted ? 'is-target' : ''}`}
+        onClick={props.onClick}
+        aria-label={`${hero.name}, ${p.hero.hp} de Moral`}
+      >
+        <span className="hero-initials">{initials}</span>
+        <span className="hero-hp">
+          <Heart size={12} strokeWidth={3} /> {p.hero.hp}
+        </span>
+        <Floaters items={props.floaters} eventKey={props.eventKey} />
+      </button>
+      <div className="hero-info">
+        <strong>{hero.name}</strong>
+        <span className="hero-meta">
+          <span title="Merenda">
+            <Sandwich {...ICON} /> {p.merenda}/{p.maxMerenda}
+          </span>
+          <span title="Mão / deck">
+            <Layers {...ICON} /> {p.hand.length}/{p.deck.length}
+          </span>
+          {props.thinking && <span className="thinking">pensando…</span>}
+        </span>
+      </div>
+      <button
+        className={`hero-power ${props.powerReady ? 'is-ready' : ''} ${props.powerActive ? 'is-active' : ''}`}
+        onClick={props.onPower}
+        disabled={!props.onPower || !props.powerReady}
+        title={`${hero.power.name} (${hero.power.cost}): ${hero.power.text}`}
+      >
+        <span className="hero-power-cost">{hero.power.cost}</span>
+        <span className="hero-power-name">{hero.power.name}</span>
+        {p.hero.powerUsed && <span className="hero-power-used">usado</span>}
+      </button>
     </div>
   );
 }
 
-interface RowProps {
+function Board(props: {
   side: Side;
   state: GameState;
   auras: ReturnType<typeof computeAuras>;
-  recent: { e: LogEvent; i: number }[];
-  revealing: boolean;
-  pending?: { slot: number; defId: string }[];
-  tapSlot?: number;
-  targetable: boolean;
-  onSlot: (slot: number) => void;
-}
-
-function Row({ side, state, auras, recent, revealing, pending = [], tapSlot, targetable, onSlot }: RowProps) {
-  const p = state.players[side];
+  targets: Set<string>;
+  floaters: Map<string, { label: string; kind: string; i: number }[]>;
+  eventKey: number;
+  onMinion: (m: Minion, side: Side) => void;
+  placing?: boolean;
+  onPlace?: (position: number) => void;
+  attackerUid?: string | null;
+  myTurn?: boolean;
+}) {
+  const { side, state } = props;
+  const board = state.players[side].board;
+  const slot = (i: number) =>
+    props.placing ? (
+      <button key={`drop-${i}`} className="drop-zone" onClick={() => props.onPlace?.(i)} aria-label={`Colocar na posição ${i + 1}`}>
+        <Plus size={16} strokeWidth={3} />
+      </button>
+    ) : null;
   return (
-    <div className={`row row-${side === 0 ? 'me' : 'bot'}`}>
-      {p.row.map((card, slot) => {
-        const pend = pending.find((x) => x.slot === slot);
-        const floaters = recent.flatMap(({ e, i }) => {
-          if ((e.type === 'damage' || e.type === 'heal') && e.side === side && e.slot === slot)
-            return [{ i, kind: e.type, label: e.type === 'damage' ? `-${e.amount}` : `+${e.amount}` }];
-          if (e.type === 'fight' && e.amount > 0 && e.side !== side && e.targetSlot === slot)
-            return [{ i, kind: 'damage', label: `-${e.amount}` }];
-          return [];
-        });
-        const isNew = revealing && card && card.enteredRound === state.round;
-        return (
-          <button
-            key={slot}
-            className={`slot ${card ? 'has-card' : 'is-empty'} ${targetable && !card ? 'is-target' : ''} ${
-              targetable && side === 1 ? 'is-target' : ''
-            } ${tapSlot === slot ? 'is-tapped' : ''} ${pend ? 'is-pending' : ''}`}
-            onClick={() => onSlot(slot)}
-            aria-label={`Carteira ${slot + 1}${card ? `: ${cardName(card)}` : ''}`}
-          >
-            <span className="slot-number">{slot + 1}</span>
-            {card && (
-              <motion.div
-                key={card.uid}
-                className="slot-card"
-                initial={isNew ? { rotateY: 180, scale: 0.9 } : false}
-                animate={{ rotateY: 0, scale: 1 }}
-                transition={{ duration: 0.6, delay: 0.25 }}
-              >
-                <Card card={getCard(card.defId)} stats={statsAt(state, side, slot, auras)} size="mini" className={card.flipped ? 'is-flipped' : ''} />
-              </motion.div>
-            )}
-            {!card && pend && (
-              <div className="slot-card pending-card">
-                <Card card={getCard(pend.defId)} size="mini" />
-              </div>
-            )}
-            {tapSlot === slot && (
-              <span className="tap-mark" aria-label="Tapa marcado">
-                <Hand {...ICON} />
-              </span>
-            )}
-            <AnimatePresence>
-              {floaters.map(({ i, kind, label }) => (
-                <motion.span
-                  key={i}
-                  className={`floater ${kind}`}
-                  initial={{ y: 8, opacity: 0, scale: 0.6 }}
-                  animate={{ y: -24, opacity: 1, scale: 1.2 }}
-                  exit={{ opacity: 0 }}
-                  transition={{ duration: 0.5 }}
-                >
-                  {label}
-                </motion.span>
-              ))}
-            </AnimatePresence>
-          </button>
-        );
-      })}
+    <div className={`board board-${side === 0 ? 'me' : 'bot'}`}>
+      {board.length === 0 && !props.placing && <span className="board-empty">Mesa vazia</span>}
+      {slot(0)}
+      <AnimatePresence initial={false}>
+        {board.map((m, i) => {
+          const def = getCard(m.defId);
+          const st = minionStats(m, props.auras);
+          const ready = side === 0 && props.myTurn && canAttack(state, m.uid);
+          return [
+            <motion.button
+              layout
+              key={m.uid}
+              className={`minion ${props.targets.has(m.uid) ? 'is-target' : ''} ${ready ? 'can-attack' : ''} ${
+                props.attackerUid === m.uid ? 'is-attacker' : ''
+              } ${m.silenced ? 'is-silenced' : ''}`}
+              onClick={() => props.onMinion(m, side)}
+              initial={{ scale: 0.4, opacity: 0, y: side === 0 ? 30 : -30 }}
+              animate={{ scale: 1, opacity: 1, y: 0 }}
+              exit={{ scale: 0.3, opacity: 0, rotate: side === 0 ? -20 : 20 }}
+              transition={{ type: 'spring', stiffness: 320, damping: 24 }}
+              aria-label={`${def.name}, ${st.power} de Força, ${st.health} de Resistência`}
+            >
+              <Card card={def} stats={st} size="mini" hideCost shield={m.shield} className={m.shield ? 'has-shield' : ''} />
+              <Floaters items={props.floaters.get(m.uid)} eventKey={props.eventKey} />
+            </motion.button>,
+            slot(i + 1),
+          ];
+        })}
+      </AnimatePresence>
     </div>
   );
 }
 
-function HandView({
-  hand,
-  pending,
-  selected,
-  merenda,
-  onSelect,
-  disabled,
+function MinionDialog({
+  minion,
+  state,
+  auras,
+  onClose,
 }: {
-  hand: { uid: string; defId: string }[];
-  pending: string[];
-  selected: string | null;
-  merenda: number;
-  onSelect: (uid: string) => void;
-  disabled: boolean;
+  minion: Minion;
+  state: GameState;
+  auras: ReturnType<typeof computeAuras>;
+  onClose: () => void;
 }) {
+  const live = state.players.flatMap((p) => p.board).find((m) => m.uid === minion.uid) ?? minion;
+  const st = minionStats(live, auras);
+  const def = getCard(live.defId);
   return (
-    <div className="hand" role="list" aria-label="Sua mão">
-      {hand
-        .filter((c) => !pending.includes(c.uid))
-        .map((c) => {
-          const def = getCard(c.defId);
-          const affordable = def.cost <= merenda;
-          return (
-            <motion.button
-              layout
-              key={c.uid}
-              role="listitem"
-              className={`hand-card ${selected === c.uid ? 'is-selected' : ''} ${affordable ? '' : 'is-expensive'}`}
-              onClick={() => onSelect(c.uid)}
-              disabled={disabled}
-              aria-pressed={selected === c.uid}
-              whileHover={{ y: -6 }}
-            >
-              <Card card={def} size="mini" />
-            </motion.button>
-          );
-        })}
+    <div className="dialog-backdrop" onClick={onClose}>
+      <div className="dialog card-dialog" onClick={(e) => e.stopPropagation()}>
+        <Card card={def} stats={st} size="full" />
+        {st.keywords.length > 0 && (
+          <ul className="kw-list">
+            {st.keywords.map((k) => (
+              <li key={k}>
+                <b>{KEYWORD_INFO[k].name}:</b> {KEYWORD_INFO[k].text}
+              </li>
+            ))}
+          </ul>
+        )}
+        {live.silenced && <p className="text-muted">Levou Tapa: está sem efeitos.</p>}
+        <div className="dialog-actions">
+          <button className="btn btn-primary" onClick={onClose}>
+            Fechar
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
 
 function LogList({ events }: { events: LogEvent[] }) {
-  const items = events.filter((e) => e.type !== 'draw').slice(-80);
+  const items = events.filter((e) => e.type !== 'draw').slice(-120);
   useEffect(() => {
     document.querySelector('.log-end')?.scrollIntoView({ block: 'nearest' });
   }, [items.length]);
@@ -352,7 +397,6 @@ function LogList({ events }: { events: LogEvent[] }) {
     <ol className="log">
       {items.map((e, i) => (
         <li key={i} className={`log-${e.type} ${'side' in e ? (e.side === 0 ? 'log-me' : 'log-bot') : ''}`}>
-          {'side' in e && <span className="log-who">{e.side === 0 ? 'Você' : 'Bot'}</span>}
           {e.text}
         </li>
       ))}
@@ -365,7 +409,7 @@ function ResultDialog({ winner, onAgain, onExit }: { winner: GameState['winner']
   const title = winner === 'draw' ? 'Empate!' : winner === 0 ? 'Vitória!' : 'Derrota...';
   const body =
     winner === 'draw'
-      ? 'Os dois zeraram a Moral juntos. Bafo de respeito.'
+      ? 'Os dois zeraram juntos. Bafo de respeito.'
       : winner === 0
         ? 'Você ganhou o recreio. A banca do Seu Zé vai ficar sabendo.'
         : 'Hoje não deu. Amanhã tem recreio de novo.';

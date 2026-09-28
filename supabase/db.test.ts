@@ -124,16 +124,27 @@ describe('banco', () => {
     ).rejects.toThrow(/row-level security/);
   });
 
-  it('jogadas escondidas: ninguém lê a do outro', async () => {
+  it('heróis são públicos; fichas ficam fora dos pacotinhos', async () => {
+    const heroes = await as(null, 'anon', () => db.query<{ n: number }>('select count(*)::int as n from public.heroes'));
+    expect(heroes.rows[0].n).toBe(2);
+    const tokens = await db.query<{ id: string }>('select id from public.cards where not collectible order by id');
+    expect(tokens.rows.map((r) => r.id)).toEqual(['moleque-da-varzea', 'troco']);
+  });
+
+  it('partida: jogadores veem o andamento, mas não o estado completo (mão do outro)', async () => {
     const m = await db.query<{ id: string }>(
-      `insert into public.matches (player_a, player_b, seed, state) values ('${A}', '${B}', 1, '{}') returning id`,
+      `insert into public.matches (player_a, player_b, seed, state) values ('${A}', '${B}', 1, '{"segredo": true}') returning id`,
     );
     const id = m.rows[0].id;
-    await db.exec(`insert into public.match_moves (match_id, round, player, move) values
-      ('${id}', 1, '${A}', '{"plays":[]}'), ('${id}', 1, '${B}', '{"plays":[]}');`);
-    const seen = await as(A, 'authenticated', () => db.query<{ player: string }>('select player from public.match_moves'));
-    expect(seen.rows.map((r) => r.player)).toEqual([A]);
-    const match = await as(B, 'authenticated', () => db.query('select id from public.matches'));
-    expect(match.rows).toHaveLength(1);
+    await db.exec(`insert into public.match_actions (match_id, seq, player, action) values ('${id}', 1, '${A}', '{"type":"end"}');`);
+    const seen = await as(B, 'authenticated', () => db.query<{ turn: number }>('select id, turn, active, status from public.matches'));
+    expect(seen.rows).toHaveLength(1);
+    await expect(as(B, 'authenticated', () => db.query('select state from public.matches'))).rejects.toThrow(/permission denied/);
+    const actions = await as(B, 'authenticated', () => db.query('select seq from public.match_actions'));
+    expect(actions.rows).toHaveLength(1);
+    const outsider = '00000000-0000-0000-0000-00000000000c';
+    await db.exec(`insert into auth.users (id) values ('${outsider}');`);
+    const none = await as(outsider, 'authenticated', () => db.query('select id from public.matches'));
+    expect(none.rows).toHaveLength(0);
   });
 });
